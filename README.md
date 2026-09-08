@@ -1,6 +1,7 @@
 # Tonie Emulator for Flipper Zero
 
-Tonie tag emulation with recovery for the playback cutoff caused by a missing NFC reset.
+Fixes the Toniebox 2 playback cutoff after roughly 90 seconds when emulating
+a Tonie with Flipper Zero.
 
 **[Download FAP](https://github.com/kamilio/flipper-zero-tonies-emulator/releases/latest/download/tonie_emulator.fap)**
 

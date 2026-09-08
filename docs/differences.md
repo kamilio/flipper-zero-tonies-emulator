@@ -1,5 +1,8 @@
 # Differences from Momentum's built-in emulator
 
+The main change fixes the Toniebox 2 playback cutoff after roughly 90 seconds
+caused by the emulator getting stuck in QUIET after a missing NFC reset.
+
 The active engine starts from Momentum revision
 `d3f89dfe2ef6b01839201598e9be1590cba80322`. It embeds that revision's ISO15693
 and SLIX listeners inside the FAP so changes can ship as an application update.
