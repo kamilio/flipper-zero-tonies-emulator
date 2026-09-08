@@ -1,0 +1,14 @@
+App(
+    appid="tonie_emulator",
+    name="Tonie Emulator",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="tonie_emulator_app",
+    requires=["gui", "storage", "notification"],
+    stack_size=4 * 1024,
+    fap_category="NFC",
+    fap_icon="tonie_10px.png",
+    fap_version="0.2.0",
+    fap_author="tonies-tooling",
+    fap_description="Play saved Tonie tags. Select a file to emulate; Back returns to files.",
+    sources=["src/**/*.c"],
+)

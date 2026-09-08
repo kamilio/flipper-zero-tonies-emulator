@@ -1,0 +1,29 @@
+# Build and release outputs
+build-host/
+dist/
+*.fap
+*.elf
+*.o
+*.gcov
+*.gcda
+*.gcno
+*.dSYM/
+__pycache__/
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+# Private device data and credentials
+*.nfc
+*.log
+.env
+.env.*
+*.pem
+*.key
+
+# Private local test suite and capture/replay tooling
+tests/*
+!tests/test_quiet_recovery.c
+!tests/test_log_sink.c
+Makefile.local
+tools/trace_replay.c

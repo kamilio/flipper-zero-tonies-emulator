@@ -1,0 +1,11 @@
+Tonie Emulator
+
+Includes ISO15693 and SLIX listener code and data helpers from
+Next-Flip/Momentum-Firmware, revision d3f89dfe:
+https://github.com/Next-Flip/Momentum-Firmware
+
+Upstream license: GNU GPL version 3. See LICENSE and
+src/native/vendor/README.md for provenance and local changes.
+
+The launcher icon is original pixel art created for this project.
+This is an independent project, not an official tonies product.
