@@ -27,3 +27,6 @@ tests/*
 !tests/test_log_sink.c
 Makefile.local
 tools/trace_replay.c
+
+# Unused local firmware experiments
+firmware/

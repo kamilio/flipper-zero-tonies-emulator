@@ -4,9 +4,6 @@ permissions:
   contents: read
 jobs:
   build-fap:
-    strategy:
-      matrix:
-        firmware: [stock, patched]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,28 +14,13 @@ jobs:
           ref: e1784e7418d8b074e971983ceb6fef0f37e52ae4
           submodules: recursive
           path: momentum
-      - name: Apply NFC-V firmware fixes
-        if: matrix.firmware == 'patched'
-        working-directory: momentum
-        run: |
-          git apply --check ../app/firmware/mntm-012-nfcv.patch
-          git apply ../app/firmware/mntm-012-nfcv.patch
       - run: make -C app check
       - run: ln -s "$GITHUB_WORKSPACE/app" momentum/applications_user/tonie_emulator
       - run: ./fbt fap_tonie_emulator
         working-directory: momentum
-      - name: Compile patched firmware components
-        if: matrix.firmware == 'patched'
-        working-directory: momentum
-        run: >-
-          ./fbt COMPACT=1 DEBUG=0
-          build/f7-firmware-C/nfc/protocols/iso15693_3/iso15693_3_listener.o
-          build/f7-firmware-C/nfc/protocols/iso15693_3/iso15693_3_listener_i.o
-          build/f7-firmware-C/nfc/protocols/slix/slix_listener.o
-          build/f7-firmware-C/targets/f7/furi_hal/furi_hal_nfc_iso15693.o
       - run: cp momentum/build/f7-firmware-C/.extapps/tonie_emulator.fap tonie_emulator.fap
       - uses: actions/upload-artifact@v4
         with:
-          name: tonie_emulator-${{ matrix.firmware }}
+          name: tonie_emulator
           path: tonie_emulator.fap
           if-no-files-found: error

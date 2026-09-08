@@ -48,15 +48,6 @@ Host tests cover the recovery guards, repeated missing-reset sequences, portable
 protocol handling, and logger write failures. Test credential values are synthetic.
 Private RF captures and NFC dumps are intentionally not distributed.
 
-## PR #566 and remaining transport limits
-
-The optional firmware patch backports selected inventory-mask, slot and response-rate
-changes from [Momentum PR #566](https://github.com/Next-Flip/Momentum-Firmware/pull/566).
-It was not flashed during the successful playback test. Low-rate and dual-subcarrier
-support are separate transport concerns; the observed requests used high-rate,
-single-subcarrier operation. The portable core is retained for research but is not
-the active playback engine.
-
 ## Primary references
 
 - [Momentum ISO15693 HAL](https://github.com/Next-Flip/Momentum-Firmware/blob/d3f89dfe2ef6b01839201598e9be1590cba80322/targets/f7/furi_hal/furi_hal_nfc_iso15693.c)

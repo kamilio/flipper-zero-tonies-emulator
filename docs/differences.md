@@ -40,15 +40,6 @@ not a general improvement to anticollision behavior for arbitrary NFC readers.
 It does not force lock bits to locked, bypass password validation, or use a timer
 to impersonate RF field loss.
 
-## What PR #566 contributes
-
-The `firmware/` directory contains an optional backport of selected inventory
-mask/slot and requested reply-rate changes from Momentum PR #566, plus documented
-state corrections. That patch changes firmware and must be built separately.
-It is not applied by installing this FAP, and was not flashed during the successful
-playback test. The PR's timing bypass and incomplete dual-subcarrier implementation
-were not adopted as the application's default transport.
-
 ## Separate experimental protocol core
 
 `src/protocol/` retains the earlier standalone parser for development. Its protocol
@@ -66,4 +57,4 @@ log records. See [research.md](research.md) for aggregate results.
 
 This validates the observed failure on the tested setup. It does not establish
 universal compatibility, indefinite playback, or correct physical field-reset
-handling. The optional firmware patch has not received equivalent playback testing.
+handling.

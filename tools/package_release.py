@@ -13,7 +13,7 @@ PUBLIC_FILES = (
     'CONTRIBUTING.md', 'application.fam', 'tonie_10px.png', 'Makefile',
     'tests/test_quiet_recovery.c', 'tests/test_log_sink.c',
 )
-PUBLIC_TREES = ('.github', 'src', 'tools', 'docs', 'firmware')
+PUBLIC_TREES = ('.github', 'src', 'tools', 'docs')
 FORBIDDEN_SUFFIXES = {'.nfc', '.log', '.pem', '.key', '.gcda', '.gcno', '.pyc', '.mp3'}
 
 def source_files():
