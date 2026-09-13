@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1
+
+- Reject reserved command `0x00` before indexing either embedded NFC command table,
+  preventing an out-of-bounds handler lookup.
+- Test all 256 command values in both dispatchers under address and undefined
+  behavior sanitizers; include the regression test in source releases.
+
+Validation: the pre-fix dispatcher reproduced an out-of-bounds access under UBSan.
+All host checks pass after the fix. This defect has not been linked to a captured
+Toniebox exchange or the reported device crashes; patched hardware playback has
+not yet been validated.
+
 ## 0.2.0
 
 - Recover the captured Toniebox cutoff caused by a missing reset after QUIET.

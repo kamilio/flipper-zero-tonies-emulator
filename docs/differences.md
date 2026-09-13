@@ -48,8 +48,8 @@ to impersonate RF field loss.
 `src/protocol/` retains the earlier standalone parser for development. Its protocol
 fixes and synthetic coverage do not all apply to the active embedded listener.
 There is no mode switch or experimental timing control in the public UI.
-Only two synthetic test suites are published; private captures and local replay
-tools are excluded.
+Synthetic recovery, logging, and embedded command-dispatch tests are published;
+private captures and local replay tools are excluded.
 
 ## Evidence and limits
 

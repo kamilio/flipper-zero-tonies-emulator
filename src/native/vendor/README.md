@@ -12,6 +12,8 @@ adjusted for embedding; `.c` files use `.inc` so the app wrapper can intercept T
 `data_helpers.inc` contains ten unexported helper functions copied from the same
 revision; each function identifies its original filename.
 
-The vendor files retain baseline protocol behavior. The surrounding
+Local hardening: both mandatory-command table lookups check the lower bound,
+so reserved command `0x00` cannot index before the handler table. Other vendor
+behavior retains the baseline. The surrounding
 `tonie_native.c` adds bounded RX/TX trace records and invokes the Toniebox-specific
 policy in `quiet_recovery.h`. Formatting and SD writes run on the logger thread.

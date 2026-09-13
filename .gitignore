@@ -25,6 +25,7 @@ __pycache__/
 tests/*
 !tests/test_quiet_recovery.c
 !tests/test_log_sink.c
+!tests/test_native_dispatch.py
 Makefile.local
 tools/trace_replay.c
 

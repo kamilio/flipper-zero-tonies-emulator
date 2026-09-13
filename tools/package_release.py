@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = (
     '.gitignore', '.gitattributes', 'README.md', 'LICENSE', 'NOTICE', 'CHANGELOG.md',
     'CONTRIBUTING.md', 'application.fam', 'tonie_10px.png', 'Makefile',
-    'tests/test_quiet_recovery.c', 'tests/test_log_sink.c',
+    'tests/test_quiet_recovery.c', 'tests/test_log_sink.c', 'tests/test_native_dispatch.py',
 )
 PUBLIC_TREES = ('.github', 'src', 'tools', 'docs')
 FORBIDDEN_SUFFIXES = {'.nfc', '.log', '.pem', '.key', '.gcda', '.gcno', '.pyc', '.mp3'}

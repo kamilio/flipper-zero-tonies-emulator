@@ -18,3 +18,4 @@ check:
 	$(CC) $(CHECK_FLAGS) tests/test_log_sink.c -o build-host/test_log_sink
 	./build-host/test_quiet_recovery
 	./build-host/test_log_sink
+	$(PYTHON) tests/test_native_dispatch.py

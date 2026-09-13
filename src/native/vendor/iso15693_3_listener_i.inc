@@ -24,7 +24,8 @@ static Iso15693_3Error
 
         Iso15693_3ExtensionHandler handler = NULL;
 
-        if(command < ISO15693_3_CMD_MANDATORY_RFU) {
+        if(command >= ISO15693_3_CMD_MANDATORY_START &&
+           command < ISO15693_3_CMD_MANDATORY_RFU) {
             const Iso15693_3ExtensionHandler* mandatory = instance->extension_table->mandatory;
             handler = mandatory[command - ISO15693_3_CMD_MANDATORY_START];
         } else if(command >= ISO15693_3_CMD_OPTIONAL_START && command < ISO15693_3_CMD_OPTIONAL_RFU) {
@@ -641,7 +642,8 @@ static Iso15693_3Error iso15693_3_listener_handle_standard_request(
     do {
         Iso15693_3RequestHandler handler = NULL;
 
-        if(command < ISO15693_3_CMD_MANDATORY_RFU) {
+        if(command >= ISO15693_3_CMD_MANDATORY_START &&
+           command < ISO15693_3_CMD_MANDATORY_RFU) {
             handler = iso15693_3_handler_table.mandatory[command - ISO15693_3_CMD_MANDATORY_START];
         } else if(command >= ISO15693_3_CMD_OPTIONAL_START && command < ISO15693_3_CMD_OPTIONAL_RFU) {
             handler = iso15693_3_handler_table.optional[command - ISO15693_3_CMD_OPTIONAL_START];

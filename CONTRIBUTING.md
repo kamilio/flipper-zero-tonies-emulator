@@ -1,8 +1,9 @@
 # Contributing
 
 Use Python 3 for release packaging and a C11 compiler for `make check`.
-Two synthetic tests cover quiet recovery and logger buffering. Private captures
-and the broader local test suite are not distributed.
+Synthetic tests cover quiet recovery, logger buffering, and embedded command
+dispatch bounds. Private captures and the broader local test suite are not
+distributed.
 
 Build the application against the pinned Momentum SDK:
 
