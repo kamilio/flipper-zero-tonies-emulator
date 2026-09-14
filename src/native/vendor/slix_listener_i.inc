@@ -413,8 +413,13 @@ static Iso15693_3Error
         const uint32_t block_num = va_arg(args, uint32_t);
 
         if(block_num == SLIX_COUNTER_BLOCK_NUM) {
-            const uint32_t counter = *(va_arg(args, uint32_t*));
-            if(counter == 0x00000001U) {
+            if(instance->data->iso15693_3_data->system_info.block_size != 4) {
+                error = Iso15693_3ErrorFormat;
+                break;
+            }
+            /* RF payloads are byte-aligned, and the caller passes uint8_t*. */
+            const uint8_t* counter = va_arg(args, const uint8_t*);
+            if(counter[0] == 1 && counter[1] == 0 && counter[2] == 0 && counter[3] == 0) {
                 if(slix_is_counter_increment_protected(instance->data) &&
                    slix_listener_is_password_lock_enabled(instance, SlixPasswordTypeRead)) {
                     error = Iso15693_3ErrorInternal;

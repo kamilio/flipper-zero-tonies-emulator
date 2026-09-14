@@ -13,7 +13,12 @@ adjusted for embedding; `.c` files use `.inc` so the app wrapper can intercept T
 revision; each function identifies its original filename.
 
 Local hardening: both mandatory-command table lookups check the lower bound,
-so reserved command `0x00` cannot index before the handler table. Other vendor
-behavior retains the baseline. The surrounding
+so reserved command `0x00` cannot index before the handler table. Memory handlers
+validate start/count and exact payload sizes before indexing; multi-block writes
+index payloads relative to the requested first block. Read/security replies are
+bounded to the TX buffer with CRC space reserved. AFI/DSFID writes require their
+exact one-byte payload. SLIX counter writes read byte-aligned payloads without a
+32-bit pointer cast and reject incompatible block sizes. Other vendor behavior
+retains the baseline. The surrounding
 `tonie_native.c` adds bounded RX/TX trace records and invokes the Toniebox-specific
 policy in `quiet_recovery.h`. Formatting and SD writes run on the logger thread.
