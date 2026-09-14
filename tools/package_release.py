@@ -12,6 +12,10 @@ PUBLIC_FILES = (
     '.gitignore', '.gitattributes', 'README.md', 'LICENSE', 'NOTICE', 'CHANGELOG.md',
     'CONTRIBUTING.md', 'application.fam', 'tonie_10px.png', 'Makefile',
     'tests/test_quiet_recovery.c', 'tests/test_log_sink.c', 'tests/test_native_dispatch.py',
+    'tests/test_sanitize.c', 'tests/test_writer.c', 'tests/test_listener_memory.py',
+    'tests/test_write_controls.py', 'tests/test_reader.py', 'tests/test_read_check.py',
+    'tests/stubs/furi.h', 'tests/stubs/toolbox/bit_buffer.h',
+    'tests/stubs/nfc/protocols/iso15693_3/iso15693_3_poller.h',
 )
 PUBLIC_TREES = ('.github', 'src', 'tools', 'docs')
 FORBIDDEN_SUFFIXES = {'.nfc', '.log', '.pem', '.key', '.gcda', '.gcno', '.pyc', '.mp3'}

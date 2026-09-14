@@ -21,7 +21,8 @@ still come from the installed firmware. This is not a full firmware replacement.
 | User flow | Firmware NFC application flow | Selecting a file starts emulation; Back returns to files |
 | Main screen | Firmware NFC interface | Tonie name and Back control; no redundant Emulating label or RF counters |
 | Indicator | Firmware/application notification behavior | Steady dim blue LED during emulation; cleared when returning to files |
-| Saved dump | Firmware-dependent application handling | Loaded data is copied; emulated changes are not saved to the source file |
+| Saved dump | Firmware-dependent application handling | Loaded data is copied; emulated changes are not saved to the source file. Loaded dumps are sanitized in RAM: lock bits cleared, AcceptAllPasswords set (safe chip cloning; the Toniebox accepts unlocked blocks) |
+| Chip writing | None | Up key writes the loaded dump to a rewritable magic SLI/SLIX chip: non-addressed block writes, then Gen2 magic commands 0x40/0x41 set the dump UID (sequence inspired by [SLI-Writer](https://github.com/Julienbxl/SLI-Writer), Normal mode) |
 
 ## Exact scope of the recovery
 

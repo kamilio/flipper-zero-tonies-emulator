@@ -1,5 +1,7 @@
 #include "../protocol/tonie_protocol.h"
 #include "log_sink.h"
+#include "writer.h"
+#include "reader.h"
 #include "../native/tonie_native.h"
 #include <stdatomic.h>
 
@@ -11,15 +13,23 @@
 #include <gui/elements.h>
 #include <gui/gui.h>
 #include <gui/view_port.h>
+#include <gui/view_dispatcher.h>
+#include <gui/modules/submenu.h>
+#include <assets_icons.h>
 #include <input/input.h>
 #include <notification/notification_messages.h>
 #include <nfc/helpers/iso13239_crc.h>
 #include <nfc/nfc.h>
 #include <nfc/nfc_device.h>
 #include <nfc/nfc_listener.h>
+#include <nfc/nfc_poller.h>
 #include <nfc/protocols/iso15693_3/iso15693_3.h>
+#include <nfc/protocols/iso15693_3/iso15693_3_poller.h>
 #include <nfc/protocols/slix/slix.h>
+#include <nfc/protocols/slix/slix_poller.h>
 #include <storage/storage.h>
+#include <cli/cli.h>
+#include <toolbox/cli/cli_registry.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -46,6 +56,14 @@ static const NotificationSequence sequence_emulating = {
 };
 
 typedef enum { TimingDefault, TimingFast, TimingCustom } TimingMode;
+typedef enum { MoreNone, MoreClear, MoreRead } MoreAction;
+typedef enum { ChipWrite, ChipClear, ChipAuth } ChipOperation;
+typedef struct {
+    ViewDispatcher* dispatcher;
+    MoreAction action;
+} MoreMenu;
+
+typedef enum { WriterUnavailable, WriterIdle, WriterRequested, WriterRunning, WriterResult } WriterState;
 
 typedef struct {
     uint16_t len;
@@ -66,6 +84,28 @@ typedef struct {
     FuriThread* log_thread;
     File* log_file;
     Nfc* nfc;
+    NfcPoller* write_poller;
+    TonieWriter* writer;
+    ChipOperation operation;
+    ChipOperation ui_operation;
+    NfcDevice* clear_snapshot;
+    bool clear_detected;
+    bool clear_confirmed;
+    unsigned auth_attempts;
+    uint16_t operation_blocks;
+    char write_result[64];
+    bool write_ok;
+    bool write_result_visible;
+    FuriMutex* ui_mutex;
+    char ui_title[96];
+    char ui_status[64];
+    bool ui_writing;
+    bool ui_result;
+    bool ui_loaded;
+    FuriString* ui_text;
+    atomic_bool cancel_requested;
+    uint32_t last_poller_error_tick;
+    bool emulation_active; /* Main-thread ownership; independent of callback state. */
     TonieNative* native_listener;
     NfcError last_tx_error;
     bool native_mode;
@@ -74,6 +114,7 @@ typedef struct {
     FuriString* file_path;
     TonieTag tag;
     TonieSession session;
+    atomic_int writer_state; /* CLI "write_chip" command trigger */
     atomic_bool running;
     atomic_bool logger_running;
     atomic_bool log_io_error;
@@ -100,6 +141,28 @@ static uint32_t elapsed_ms(const TonieApp* app) {
 static void log_line(TonieApp* app, const char* format, ...) {
     if(!app->logger_running || !app->log_queue) return;
     if(app->log_io_error) {++app->dropped_logs;return;}
+    LogLine line = {0};
+    const uint32_t ms = elapsed_ms(app);
+    int prefix = snprintf(line.text, sizeof(line.text), "[%03lu.%03lu] ",
+                          (unsigned long)(ms / 1000U), (unsigned long)(ms % 1000U));
+    if(prefix < 0) return;
+    va_list args;
+    va_start(args, format);
+    int body = vsnprintf(line.text + prefix, sizeof(line.text) - (size_t)prefix, format, args);
+    va_end(args);
+    if(body < 0) return;
+    size_t used = (size_t)prefix + (size_t)body;
+    if(used >= sizeof(line.text) - 1U) used = sizeof(line.text) - 2U;
+    line.text[used++] = '\n';
+    line.text[used] = '\0';
+    line.len = (uint16_t)used;
+    if(furi_message_queue_put(app->log_queue, &line, 0) != FuriStatusOk) ++app->dropped_logs;
+}
+
+/* Writer hook: writer.c logs per-step progress into the session log. */
+void tonie_app_writer_log(void* context, const char* format, ...) {
+    TonieApp* app = context;
+    if(!app->logger_running || !app->log_queue || app->log_io_error) return;
     LogLine line = {0};
     const uint32_t ms = elapsed_ms(app);
     int prefix = snprintf(line.text, sizeof(line.text), "[%03lu.%03lu] ",
@@ -178,15 +241,17 @@ static bool logger_start(TonieApp* app) {
     app->log_io_error=false;memset(&app->log_sink,0,sizeof(app->log_sink));
     app->log_file=storage_file_alloc(app->storage);
     bool opened=false;
-    for(unsigned suffix=0;suffix<10000;++suffix) {
+    for(unsigned suffix=0;suffix<100;++suffix) {
         snprintf(app->log_path,sizeof(app->log_path),
                  LOG_DIR "/%04u-%02u-%02u_%02u%02u%02u-%04u.log",
                  now.year,now.month,now.day,now.hour,now.minute,now.second,suffix);
-        if(storage_common_stat(app->storage,app->log_path,NULL)==FSE_OK) continue;
+        const FS_Error stat = storage_common_stat(app->storage,app->log_path,NULL);
+        if(stat == FSE_OK) continue;
+        if(stat != FSE_NOT_EXIST) break;
         opened=storage_file_open(app->log_file,app->log_path,FSAM_WRITE,FSOM_CREATE_NEW);break;
     }
     if(!opened) {storage_file_free(app->log_file);app->log_file=NULL;return false;}
-    app->log_queue = furi_message_queue_alloc(64, sizeof(LogLine));
+    app->log_queue = furi_message_queue_alloc(16, sizeof(LogLine));
     app->logger_running = true;
     app->log_thread = furi_thread_alloc_ex("TonieLog", 4096, logger_worker, app);
     furi_thread_start(app->log_thread);
@@ -222,6 +287,98 @@ static void log_result(TonieApp* app, const TonieProtocolResult* result) {
             result->response, result->response_len);
     if(app->last_tx_error != NfcErrorNone)
         log_line(app, "TX ERROR nfc_error=%u", (unsigned)app->last_tx_error);
+}
+
+static unsigned exchange_iso(void* poller, const BitBuffer* tx, BitBuffer* rx, uint32_t timeout) {
+    return iso15693_3_poller_send_frame(poller, tx, rx, timeout);
+}
+
+static unsigned exchange_slix(void* poller, const BitBuffer* tx, BitBuffer* rx, uint32_t timeout) {
+    return slix_poller_send_frame(poller, tx, rx, timeout);
+}
+
+/* Normal writes retain the ISO poller. Clear/Auth use the same privacy-password
+ * sequence as the firmware's Auth As TommyBox menu, through the SLIX API. */
+static NfcCommand writer_poller_callback(NfcGenericEvent event, void* context) {
+    TonieApp* app = context;
+    if(!app->running) return NfcCommandStop;
+    if(atomic_load(&app->cancel_requested)) {
+        snprintf(app->write_result, sizeof(app->write_result), "Cancelled");
+        app->running = false;
+        return NfcCommandStop;
+    }
+    TonieWriterTransport transport = {.context = event.instance};
+    bool ready = false;
+    unsigned error = 0;
+    const Iso15693_3Data* iso = NULL;
+    const NfcDeviceData* data = nfc_poller_get_data(app->write_poller);
+    if(event.protocol == NfcProtocolSlix) {
+        SlixPollerEvent* e = event.event_data;
+        if(e->type == SlixPollerEventTypePrivacyUnlockRequest) {
+            static const SlixPassword passwords[] = {0x5B6EFD7F, 0x0F0F0F0F};
+            e->data->privacy_password.password = passwords[app->auth_attempts++ % 2];
+            e->data->privacy_password.password_set = true;
+            return NfcCommandContinue;
+        }
+        ready = e->type == SlixPollerEventTypeReady;
+        if(e->type == SlixPollerEventTypeError) error = e->data->error;
+        transport.exchange = exchange_slix;
+        iso = ((const SlixData*)data)->iso15693_3_data;
+    } else if(event.protocol == NfcProtocolIso15693_3) {
+        Iso15693_3PollerEvent* e = event.event_data;
+        ready = e->type == Iso15693_3PollerEventTypeReady;
+        if(e->type == Iso15693_3PollerEventTypeError) error = e->data->error;
+        transport.exchange = exchange_iso;
+        iso = data;
+    } else return NfcCommandContinue;
+    if(!ready) {
+        if(error && furi_get_tick() - app->last_poller_error_tick >= furi_kernel_get_tick_frequency()) {
+            app->last_poller_error_tick = furi_get_tick();
+            log_line(app, "CHIP poll error=%u", error);
+        }
+        return NfcCommandContinue;
+    }
+    if(app->operation == ChipAuth) {
+        app->write_ok = true;
+        snprintf(app->write_result, sizeof(app->write_result), "%s",
+                 app->auth_attempts ? "Authenticated and unlocked" : "Chip already unlocked");
+    } else if(app->operation == ChipClear) {
+        const uint16_t count = iso15693_3_get_block_count(iso);
+        const uint8_t size = iso15693_3_get_block_size(iso);
+        bool locked = false;
+        if(!count || count > 128 || size != 4) {
+            snprintf(app->write_result, sizeof(app->write_result), "Unsupported chip size");
+            goto done;
+        }
+        for(uint16_t i = 0; i < count; ++i)
+            if(iso15693_3_is_block_locked(iso, (uint8_t)i)) locked = true;
+        if(locked) {
+            snprintf(app->write_result, sizeof(app->write_result), "Permanently locked blocks\nCannot safely clear");
+            goto done;
+        }
+        if(!app->clear_confirmed) {
+            nfc_device_set_data(app->clear_snapshot, event.protocol, data);
+            app->operation_blocks = count;
+            app->clear_detected = true;
+            snprintf(app->write_result, sizeof(app->write_result), "Chip unlocked; ready to clear");
+        } else {
+            const Iso15693_3Data* before = nfc_device_get_data(app->clear_snapshot, NfcProtocolIso15693_3);
+            bool same = count == iso15693_3_get_block_count(before) && memcmp(before->uid, iso->uid, 8) == 0;
+            for(uint16_t i = 0; same && i < count; ++i)
+                same = memcmp(iso15693_3_get_block_data(before, (uint8_t)i),
+                              iso15693_3_get_block_data(iso, (uint8_t)i), 4) == 0;
+            if(!same) {
+                snprintf(app->write_result, sizeof(app->write_result), "Chip changed; clear cancelled");
+                goto done;
+            }
+            app->write_ok = tonie_writer_write(app->writer, &transport, app->write_result, sizeof(app->write_result));
+        }
+    } else {
+        app->write_ok = tonie_writer_write(app->writer, &transport, app->write_result, sizeof(app->write_result));
+    }
+done:
+    app->running = false;
+    return NfcCommandStop;
 }
 
 static NfcCommand nfc_callback(NfcEvent event, void* context) {
@@ -324,6 +481,7 @@ static bool copy_device(TonieApp* app) {
         app->tag.accept_all_passwords = slix->capabilities == SlixCapabilitiesAcceptAllPasswords;
         app->tag.privacy_persistent = slix->privacy;
     }
+    tonie_sanitize_dump(&app->tag);
     return true;
 }
 
@@ -368,7 +526,7 @@ static void native_trace(void* context, unsigned kind, const uint8_t* bytes, siz
 }
 
 static bool emulation_start(TonieApp* app) {
-    if(!app->loaded || app->running) return false;
+    if(!app->loaded || app->emulation_active || !app->nfc) return false;
     if(!copy_device(app)) return false; /* Restart with the original dump, not RAM mutations. */
     tonie_session_init(&app->session);
     app->session.random_seed = furi_hal_random_get();
@@ -392,19 +550,21 @@ static bool emulation_start(TonieApp* app) {
              app->tag.uid[4], app->tag.uid[5], app->tag.uid[6], app->tag.uid[7]);
     if(app->native_mode) tonie_native_start(app->native_listener);
     else nfc_start(app->nfc, nfc_callback, app);
+    app->emulation_active = true;
     notification_message(app->notifications, &sequence_emulating);
     snprintf(app->status, sizeof(app->status), "Emulating");
     return true;
 }
 
 static void emulation_stop(TonieApp* app) {
-    if(!app->running) return;
+    if(!app->emulation_active) return;
     app->running = false;
     if(app->native_listener) {
         tonie_native_stop(app->native_listener);
         tonie_native_free(app->native_listener);
         app->native_listener = NULL;
     } else nfc_stop(app->nfc);
+    app->emulation_active = false;
     notification_message_block(app->notifications, &sequence_reset_rgb);
     log_line(app, "STOP rx=%lu tx=%lu errors=%lu dropped_logs=%lu",
              (unsigned long)app->rx_count, (unsigned long)app->tx_count,
@@ -418,38 +578,294 @@ static const char* base_name(const char* path) {
     return slash ? slash + 1 : path;
 }
 
-static void draw(Canvas* canvas, void* context) {
-    TonieApp* app = context;
-    canvas_clear(canvas);
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "Tonie Emulator");
-    canvas_draw_line(canvas, 12, 18, 116, 18);
-
-    char title[96];
-    snprintf(title, sizeof(title), "%s", base_name(furi_string_get_cstr(app->file_path)));
-    char* extension = strrchr(title, '.');
+/* Publish a small UI snapshot; the GUI never reads mutable NFC/file state. */
+static void update_view(TonieApp* app) {
+    furi_mutex_acquire(app->ui_mutex, FuriWaitForever);
+    snprintf(app->ui_title, sizeof(app->ui_title), "%s",
+             base_name(furi_string_get_cstr(app->file_path)));
+    char* extension = strrchr(app->ui_title, '.');
     if(extension) *extension = '\0';
     bool upper = true;
-    for(char* c = title; *c; ++c) {
+    for(char* c = app->ui_title; *c; ++c) {
         if(*c == '-' || *c == '_') *c = ' ';
         if(upper && *c >= 'a' && *c <= 'z') *c -= 'a' - 'A';
         upper = *c == ' ';
     }
-    canvas_set_font(canvas, FontSecondary);
-    FuriString* name = furi_string_alloc_set_str(title);
-    elements_string_fit_width(canvas, name, 116);
-    canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignTop, furi_string_get_cstr(name));
-    furi_string_free(name);
-    if(!app->running) {
-        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignTop, app->status);
+    app->ui_writing = atomic_load(&app->writer_state) == WriterRunning && !app->write_result_visible;
+    app->ui_result = app->write_result_visible;
+    app->ui_loaded = app->loaded;
+    app->ui_operation = app->operation;
+    if(app->ui_writing && app->operation != ChipWrite)
+        snprintf(app->ui_title, sizeof(app->ui_title), "Chip at Flipper's back");
+    if(app->ui_writing) {
+        const unsigned done = tonie_writer_progress(app->writer);
+        const TonieWritePhase phase = tonie_writer_phase(app->writer);
+        if(phase == TonieWriteUid)
+            snprintf(app->ui_status, sizeof(app->ui_status), "Finishing UID; keep chip still");
+        else if(phase == TonieWriteVerify)
+            snprintf(app->ui_status, sizeof(app->ui_status), "Verifying written chip");
+        else if(atomic_load(&app->cancel_requested))
+            snprintf(app->ui_status, sizeof(app->ui_status), "Stopping...");
+        else if(phase == TonieWriteBlocks)
+            snprintf(app->ui_status, sizeof(app->ui_status), "Writing block %u / %u",
+                     done < app->operation_blocks ? done + 1 : done, app->operation_blocks);
+        else snprintf(app->ui_status, sizeof(app->ui_status), "%s",
+                      app->operation == ChipWrite ? "Hold one magic chip at back" : "Hold chip to authenticate");
+    } else {
+        snprintf(app->ui_status, sizeof(app->ui_status), "%s",
+                 app->write_result_visible ? app->write_result : app->status);
     }
-    elements_button_left(canvas, "Back to files");
+    furi_mutex_release(app->ui_mutex);
+    view_port_update(app->view_port);
+}
+
+/* Match firmware button styling, with the directional hints on the right. */
+static void draw_right_hint(Canvas* canvas, const char* label, const Icon* icon, bool top) {
+    const int32_t width = canvas_string_width(canvas, label) + 16;
+    const int32_t right = canvas_width(canvas);
+    const int32_t y = top ? 0 : canvas_height(canvas) - 12;
+    const int32_t x = right - width;
+    canvas_draw_box(canvas, x, y, width, 12);
+    for(int32_t i = 1; i <= 3; ++i)
+        canvas_draw_line(canvas, x - i, y, x - i, y + 12 - i);
+    canvas_invert_color(canvas);
+    canvas_draw_str(canvas, x + 3, y + 9, label);
+    canvas_draw_icon(canvas, right - 10, y + 5, icon);
+    canvas_invert_color(canvas);
+}
+
+static void more_selected(void* context, uint32_t index) {
+    MoreMenu* menu = context;
+    menu->action = (MoreAction)index;
+    view_dispatcher_stop(menu->dispatcher);
+}
+
+static bool more_back(void* context) {
+    MoreMenu* menu = context;
+    menu->action = MoreNone;
+    return false;
+}
+
+static MoreAction show_more(TonieApp* app) {
+    atomic_store(&app->writer_state, WriterUnavailable);
+    gui_remove_view_port(app->gui, app->view_port);
+    MoreMenu menu = {.dispatcher = view_dispatcher_alloc(), .action = MoreNone};
+    Submenu* submenu = submenu_alloc();
+    submenu_set_header(submenu, "More");
+    submenu_add_item(submenu, "Clear", MoreClear, more_selected, &menu);
+    submenu_add_item(submenu, "Read", MoreRead, more_selected, &menu);
+    view_dispatcher_set_event_callback_context(menu.dispatcher, &menu);
+    view_dispatcher_set_navigation_event_callback(menu.dispatcher, more_back);
+    view_dispatcher_add_view(menu.dispatcher, 0, submenu_get_view(submenu));
+    view_dispatcher_attach_to_gui(menu.dispatcher, app->gui, ViewDispatcherTypeFullscreen);
+    view_dispatcher_switch_to_view(menu.dispatcher, 0);
+    view_dispatcher_run(menu.dispatcher);
+    view_dispatcher_remove_view(menu.dispatcher, 0);
+    submenu_free(submenu);
+    view_dispatcher_free(menu.dispatcher);
+    furi_message_queue_reset(app->input_queue);
+    gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
+    atomic_store(&app->writer_state, WriterIdle);
+    return menu.action;
+}
+
+static void draw(Canvas* canvas, void* context) {
+    TonieApp* app = context;
+    furi_mutex_acquire(app->ui_mutex, FuriWaitForever);
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontSecondary);
+    if(!app->ui_writing && !app->ui_result && app->ui_loaded)
+        draw_right_hint(canvas, "Write", &I_ButtonUp_7x4, true);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 17, AlignCenter, AlignTop,
+                           app->ui_writing ? (app->ui_operation == ChipClear ? "Clear chip" :
+                                              app->ui_operation == ChipAuth ? "Read" : "Writing") :
+                           app->ui_result ? (app->ui_operation == ChipClear ? "Clear result" :
+                                             app->ui_operation == ChipAuth ? "Auth result" : "Write result") : "Tonie Emulator");
+    canvas_set_font(canvas, FontSecondary);
+    FuriString* name = app->ui_text;
+    furi_string_set(name, app->ui_title);
+    elements_string_fit_width(canvas, name, 120);
+    if(!app->ui_result)
+        canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignTop, furi_string_get_cstr(name));
+    if(app->ui_result) {
+        /* Results may include partial-write details; wrap instead of hiding them. */
+        elements_text_box(canvas, 1, 29, 126, 24, AlignCenter, AlignCenter, app->ui_status, true);
+    } else {
+        furi_string_set(name, app->ui_status);
+        elements_string_fit_width(canvas, name, 124);
+        canvas_draw_str_aligned(canvas, 64, 41, AlignCenter, AlignTop, furi_string_get_cstr(name));
+    }
+    if(app->ui_writing) elements_button_left(canvas, "Cancel");
+    else if(app->ui_result) elements_button_center(canvas, "Done");
+    else {
+        elements_button_left(canvas, "Files");
+        if(app->ui_loaded) draw_right_hint(canvas, "More", &I_ButtonDown_7x4, false);
+    }
+    furi_mutex_release(app->ui_mutex);
 }
 
 static void input(InputEvent* event, void* context) {
     TonieApp* app = context;
+    if(event->type != InputTypeShort) return;
+    if(event->key != InputKeyBack && event->key != InputKeyLeft &&
+       event->key != InputKeyUp && event->key != InputKeyDown && event->key != InputKeyOk) return;
+    const int state = atomic_load(&app->writer_state);
+    if(state == WriterRunning || state == WriterRequested) {
+        /* Cancellation must survive a full input queue. Never enqueue repeats. */
+        if(event->key == InputKeyBack || event->key == InputKeyLeft)
+            atomic_store(&app->cancel_requested, true);
+        return;
+    }
     furi_message_queue_put(app->input_queue, event, 0);
 }
+
+/* CLI command: "write_chip" inside the running app schedules the magic-chip
+ * writer, letting scripts drive the flow over USB. (Named write_chip because
+ * the firmware "input" CLI swallows bare direction words like "up".) */
+static void cli_write_chip_command(PipeSide* pipe, FuriString* args, void* context) {
+    UNUSED(pipe);
+    UNUSED(args);
+    TonieApp* app = context;
+    if(!app) return;
+    int expected = WriterIdle;
+    atomic_compare_exchange_strong(&app->writer_state, &expected, WriterRequested);
+}
+
+static bool backup_clear_chip(TonieApp* app) {
+    const char* directory = EXT_PATH("apps_data/tonie_emulator/backups");
+    storage_common_mkdir(app->storage, directory);
+    char path[128];
+    bool saved = false;
+    for(unsigned attempt = 0; attempt < 100; ++attempt) {
+        snprintf(path, sizeof(path), "%s/clear-%08lx-%u.nfc", directory,
+                 (unsigned long)furi_get_tick(), attempt);
+        const FS_Error stat = storage_common_stat(app->storage, path, NULL);
+        if(stat == FSE_OK) continue;
+        if(stat != FSE_NOT_EXIST) break;
+        saved = nfc_device_save(app->clear_snapshot, path);
+        break;
+    }
+    if(!saved) return false;
+    NfcDevice* verify = nfc_device_alloc();
+    saved = nfc_device_load(verify, path) && nfc_device_is_equal(app->clear_snapshot, verify);
+    nfc_device_free(verify);
+    if(saved) log_line(app, "CLEAR backup verified: %s", path);
+    return saved;
+}
+
+static bool confirm_clear(TonieApp* app) {
+    const Iso15693_3Data* iso = nfc_device_get_data(app->clear_snapshot, NfcProtocolIso15693_3);
+    char text[100];
+    snprintf(text, sizeof(text), "Chip ...%02X%02X%02X%02X\nErase %u blocks?\nBackup saved; UID stays.",
+             iso->uid[4], iso->uid[5], iso->uid[6], iso->uid[7], app->operation_blocks);
+    DialogMessage* message = dialog_message_alloc();
+    dialog_message_set_header(message, "Clear chip data?", 64, 2, AlignCenter, AlignTop);
+    dialog_message_set_text(message, text, 64, 18, AlignCenter, AlignTop);
+    dialog_message_set_buttons(message, "Cancel", NULL, "Clear");
+    const bool confirmed = dialog_message_show(app->dialogs, message) == DialogMessageButtonRight;
+    dialog_message_free(message);
+    return confirmed;
+}
+
+static void run_write_cycle(TonieApp* app, ChipOperation operation) {
+    app->operation = operation;
+    atomic_store(&app->writer_state, WriterRunning);
+    InputEvent pending;
+    while(furi_message_queue_get(app->input_queue, &pending, 0) == FuriStatusOk)
+        if(pending.key == InputKeyBack || pending.key == InputKeyLeft)
+            atomic_store(&app->cancel_requested, true);
+    emulation_stop(app);
+    app->write_ok = false;
+    app->write_result_visible = false;
+    app->clear_confirmed = app->clear_detected = false;
+    tonie_writer_set_dump(app->writer, NULL, NULL, 0, 0);
+    if(atomic_load(&app->cancel_requested)) {
+        snprintf(app->write_result, sizeof(app->write_result), "Cancelled");
+        goto finished;
+    }
+    if(operation == ChipWrite) {
+        if(!app->loaded || !copy_device(app) || !tonie_writer_set_dump(
+               app->writer, app->tag.uid, app->tag.blocks, app->tag.block_count, app->tag.block_size)) {
+            snprintf(app->write_result, sizeof(app->write_result), "Unsupported dump geometry");
+            goto finished;
+        }
+        app->operation_blocks = app->tag.block_count;
+    }
+    if(operation == ChipClear) app->clear_snapshot = nfc_device_alloc();
+    app->rx_count = app->tx_count = app->errors = app->dropped_logs = 0;
+    app->started_tick = furi_get_tick();
+    if(!logger_start(app)) {
+        snprintf(app->write_result, sizeof(app->write_result), "Cannot open session log");
+        goto finished;
+    }
+    tonie_writer_set_logger(app->writer, app);
+    log_line(app, "CHIP START operation=%u", operation);
+    for(unsigned round = 0; round < 2; ++round) {
+        app->auth_attempts = 0;
+        app->last_poller_error_tick = furi_get_tick();
+        app->write_poller = nfc_poller_alloc(app->nfc,
+            operation == ChipWrite ? NfcProtocolIso15693_3 : NfcProtocolSlix);
+        snprintf(app->write_result, sizeof(app->write_result), "No chip detected");
+        app->running = true;
+        update_view(app);
+        notification_message(app->notifications, &sequence_blink_start_blue);
+        nfc_poller_start(app->write_poller, writer_poller_callback, app);
+        const uint32_t start = furi_get_tick();
+        bool cancelled = false;
+        bool timed_out = false;
+        while(app->running) {
+            furi_delay_ms(25);
+            cancelled = atomic_load(&app->cancel_requested);
+            timed_out = furi_get_tick() - start >= 60U * furi_kernel_get_tick_frequency();
+            if(cancelled || timed_out) {
+                tonie_writer_cancel(app->writer);
+                app->running = false;
+                break;
+            }
+            update_view(app);
+        }
+        /* Join before inspecting or persisting anything filled by the callback. */
+        nfc_poller_stop(app->write_poller);
+        nfc_poller_free(app->write_poller);
+        app->write_poller = NULL;
+        if(!app->write_ok && (cancelled || timed_out) && strncmp(app->write_result, "Written;", 8) != 0)
+            snprintf(app->write_result, sizeof(app->write_result), "%s",
+                     tonie_writer_may_have_changed(app->writer) ? "Stopped; chip may be partial" :
+                     cancelled ? "Cancelled" : "No chip; timed out");
+        log_line(app, "CHIP result ok=%u: %s", app->write_ok, app->write_result);
+        if(operation != ChipClear || app->clear_confirmed || !app->clear_detected || cancelled || timed_out) break;
+        if(!backup_clear_chip(app)) {
+            snprintf(app->write_result, sizeof(app->write_result), "Backup failed; nothing erased");
+            break;
+        }
+        if(!confirm_clear(app)) {
+            snprintf(app->write_result, sizeof(app->write_result), "Clear cancelled");
+            break;
+        }
+        const Iso15693_3Data* iso = nfc_device_get_data(app->clear_snapshot, NfcProtocolIso15693_3);
+        if(!tonie_writer_set_clear(app->writer, iso->uid, app->operation_blocks)) {
+            snprintf(app->write_result, sizeof(app->write_result), "Unsupported chip size");
+            break;
+        }
+        app->clear_confirmed = true;
+    }
+    logger_stop(app);
+    notification_message(app->notifications, &sequence_reset_rgb);
+finished:
+    if(app->clear_snapshot) { nfc_device_free(app->clear_snapshot); app->clear_snapshot = NULL; }
+    if(!app->write_ok && tonie_writer_may_have_changed(app->writer) &&
+       strncmp(app->write_result, "Written;", 8) != 0 && !strstr(app->write_result, "partial")) {
+        const size_t used = strlen(app->write_result);
+        snprintf(app->write_result + used, sizeof(app->write_result) - used, "\nChip may be partial");
+    }
+    furi_message_queue_reset(app->input_queue);
+    app->write_result_visible = true;
+    atomic_store(&app->writer_state, WriterResult);
+    update_view(app);
+    notification_message(app->notifications, app->write_ok ? &sequence_success : &sequence_error);
+}
+
 
 int32_t tonie_emulator_app(void* context) {
     const char* launch_path = context;
@@ -458,16 +874,24 @@ int32_t tonie_emulator_app(void* context) {
     atomic_init(&app->running,false);atomic_init(&app->logger_running,false);
     atomic_init(&app->log_io_error,false);atomic_init(&app->rx_count,0);
     atomic_init(&app->tx_count,0);atomic_init(&app->errors,0);atomic_init(&app->dropped_logs,0);
+    atomic_init(&app->writer_state,WriterUnavailable);
+    atomic_init(&app->cancel_requested,false);
     app->gui = furi_record_open(RECORD_GUI);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     app->dialogs = furi_record_open(RECORD_DIALOGS);
     app->storage = furi_record_open(RECORD_STORAGE);
     app->device = nfc_device_alloc();
     app->nfc = nfc_alloc();
+    app->ui_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    app->ui_text = furi_string_alloc();
+    app->writer = tonie_writer_alloc();
     app->tx_buffer = bit_buffer_alloc(TONIE_MAX_RESPONSE + 2U);
     app->file_path = furi_string_alloc_set_str(NFC_DIR);
     app->input_queue = furi_message_queue_alloc(8, sizeof(InputEvent));
     app->view_port = view_port_alloc();
+    CliRegistry* cli = furi_record_open(RECORD_CLI);
+    cli_registry_add_command(
+        cli, "write_chip", CliCommandFlagParallelSafe, cli_write_chip_command, app);
     app->native_mode = true;
     app->verbose = false;
     app->custom_fdt_fc = DEFAULT_FDT_FC;
@@ -483,31 +907,75 @@ int32_t tonie_emulator_app(void* context) {
         selected = choose_file(app);
     }
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
-    if(selected) emulation_start(app);
-    view_port_update(app->view_port);
+    if(selected) {
+        emulation_start(app);
+        atomic_store(&app->writer_state, WriterIdle);
+    }
+    update_view(app);
 
     bool exit = !selected;
     while(!exit) {
+        int expected = WriterRequested;
+        if(atomic_compare_exchange_strong(&app->writer_state, &expected, WriterRunning))
+            run_write_cycle(app, ChipWrite);
         InputEvent event;
         if(furi_message_queue_get(app->input_queue, &event, 100) == FuriStatusOk &&
-           event.type == InputTypeShort &&
-           (event.key == InputKeyBack || event.key == InputKeyLeft)) {
-            emulation_stop(app);
-            gui_remove_view_port(app->gui, app->view_port);
-            selected = choose_file(app);
-            gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
-            if(selected) emulation_start(app);
-            else exit = true;
+           event.type == InputTypeShort) {
+            if(app->write_result_visible) {
+                if(event.key == InputKeyOk || event.key == InputKeyBack || event.key == InputKeyLeft) {
+                    app->write_result_visible = false;
+                    emulation_start(app);
+                    atomic_store(&app->cancel_requested, false);
+                    atomic_store(&app->writer_state, WriterIdle);
+                }
+            } else if(event.key == InputKeyBack || event.key == InputKeyLeft) {
+                atomic_store(&app->writer_state, WriterUnavailable);
+                emulation_stop(app);
+                gui_remove_view_port(app->gui, app->view_port);
+                selected = choose_file(app);
+                gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
+                furi_message_queue_reset(app->input_queue);
+                if(selected) {
+                    emulation_start(app);
+                    atomic_store(&app->cancel_requested, false);
+                    atomic_store(&app->writer_state, WriterIdle);
+                } else exit = true;
+            } else if(event.key == InputKeyDown && app->loaded) {
+                const MoreAction action = show_more(app);
+                if(action != MoreNone) {
+                    atomic_store(&app->cancel_requested, false);
+                    if(action == MoreRead) {
+                        atomic_store(&app->writer_state, WriterUnavailable);
+                        emulation_stop(app);
+                        gui_remove_view_port(app->gui, app->view_port);
+                        tonie_reader_run(app->gui, app->nfc, app->storage, app->notifications);
+                        gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
+                        furi_message_queue_reset(app->input_queue);
+                        emulation_start(app);
+                        atomic_store(&app->writer_state, WriterIdle);
+                    } else run_write_cycle(app, ChipClear);
+                }
+            } else if(event.key == InputKeyUp) {
+                /* Write the loaded dump to a rewritable magic SLI/SLIX chip. */
+                int idle = WriterIdle;
+                atomic_compare_exchange_strong(&app->writer_state, &idle, WriterRequested);
+            }
         }
-        view_port_update(app->view_port);
+        update_view(app);
     }
 
+    atomic_store(&app->writer_state, WriterUnavailable);
     emulation_stop(app);
     gui_remove_view_port(app->gui, app->view_port);
+    cli_registry_delete_command(cli, "write_chip");
+    furi_record_close(RECORD_CLI);
     view_port_free(app->view_port);
+    furi_mutex_free(app->ui_mutex);
+    furi_string_free(app->ui_text);
     furi_message_queue_free(app->input_queue);
     furi_string_free(app->file_path);
     bit_buffer_free(app->tx_buffer);
+    tonie_writer_free(app->writer);
     nfc_free(app->nfc);
     nfc_device_free(app->device);
     furi_record_close(RECORD_STORAGE);

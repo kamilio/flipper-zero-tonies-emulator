@@ -2,8 +2,18 @@
 
 Use Python 3 for release packaging and a C11 compiler for `make check`.
 Synthetic tests cover quiet recovery, logger buffering, and embedded command
-dispatch bounds. Private captures and the broader local test suite are not
-distributed.
+dispatch bounds. Writer tests use a synthetic ISO15693 chip to cover verified
+block/UID writes, retries, cancellation, invalid dumps, and malformed replies.
+They assert SLI-Writer normal-mode command bytes and order, `0x42` fallback,
+rewriting changed UIDs, and the absence of factory-UID/layout commands.
+Embedded listener tests compile the production handlers and exercise every
+8-bit block-range combination under ASan/UBSan. Control tests exercise the actual
+input/CLI callbacks with a saturated queue. Reader tests exercise the production
+save and lifecycle callbacks with injected SD failures, rapid confirmation, and
+1,000 batch cycles. Read-integrity tests cover malformed replies, truncation,
+blank data, corruption and cancellation; warning tests check OK / Save anyway
+and left / Skip. `make check` needs no firmware SDK. Private captures and the
+broader local test suite are not distributed.
 
 Build the application against the pinned Momentum SDK:
 

@@ -26,8 +26,17 @@ tests/*
 !tests/test_quiet_recovery.c
 !tests/test_log_sink.c
 !tests/test_native_dispatch.py
+!tests/test_sanitize.c
+!tests/test_writer.c
+!tests/test_listener_memory.py
+!tests/test_write_controls.py
+!tests/stubs/
 Makefile.local
 tools/trace_replay.c
 
 # Unused local firmware experiments
 firmware/
+
+!tests/test_reader.py
+
+!tests/test_read_check.py

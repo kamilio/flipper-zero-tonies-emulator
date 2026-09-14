@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define TONIE_MAX_BLOCKS 256U
 #define TONIE_MAX_BLOCK_SIZE 32U
@@ -86,6 +87,16 @@ bool tonie_inventory_mask_matches(
     const uint8_t* mask,
     uint8_t mask_bits);
 uint8_t tonie_inventory_slot(const uint8_t internal_uid[8], uint8_t mask_bits);
+/* Prepare a loaded dump for chip cloning and emulation. Real figurines report
+ * per-block lock bits; forcing them onto a rewritable clone permanently burns
+ * the blocks on most magic chips, and the Toniebox accepts unlocked blocks.
+ * AcceptAllPasswords lets clones/emulation answer the box privacy exchange
+ * without the figurine's real passwords. */
+static inline void tonie_sanitize_dump(TonieTag* tag) {
+    memset(tag->security, 0, sizeof(tag->security));
+    tag->accept_all_passwords = true;
+}
+
 void tonie_session_init(TonieSession* session);
 void tonie_cancel_pending(TonieSession* session);
 void tonie_field_on(TonieSession* session);
