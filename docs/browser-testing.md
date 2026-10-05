@@ -21,4 +21,6 @@ The FAP builds for Momentum API 87.1. Device checks covered the regular browser 
 
 Broad recursive scans remain slow; regular and folder-scoped browsing avoid them. The browser holds bounded pages; peak tracked browser allocations in the host suite were 48,207 bytes, with zero retained allocations. This is not total firmware heap usage.
 
-Physical batch capture/save, LED/vibration feedback and multiple-chip swaps remain unverified pending a live-tag test. Automated fault tests do not establish end-to-end RF behavior or guarantee absence of every crash. Green feedback confirms verified file publication; `_unchecked` scans still require review.
+A physical single-chip batch test saved two different unchecked snapshots and a verified snapshot in the invoking test directory. On-device hashes confirmed that the unchecked snapshots differed; the verified snapshot matched one earlier unchecked snapshot and was retained separately as intended. The reader displayed “Duplicate skipped” and the saved-file count stayed unchanged during repeated checks with the same chip. No NFC payloads were exported for this verification.
+
+Physical LED/vibration feedback and multiple-chip swaps still await confirmation. Automated fault tests do not establish every RF failure mode or guarantee absence of every crash. Green feedback confirms verified file publication; `_unchecked` scans still require review.
