@@ -7,8 +7,11 @@ App(
     stack_size=4 * 1024,
     fap_category="NFC",
     fap_icon="tonie_10px.png",
+    fap_icon_assets="src/lib/file_browser/icons",
     fap_version="0.2.1",
     fap_author="tonies-tooling",
     fap_description="Read and save Tonie tags in sequence, emulate saved tags, and write magic chips.",
-    sources=["src/**/*.c"],
+    sources=["src/app/*.c", "src/native/*.c", "src/protocol/*.c",
+             "src/lib/file_browser/*.c", "src/lib/file_browser/helpers/*.c",
+             "src/lib/file_browser/views/*.c"],
 )

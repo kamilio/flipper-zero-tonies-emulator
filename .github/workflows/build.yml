@@ -15,6 +15,9 @@ jobs:
           submodules: recursive
           path: momentum
       - run: make -C app check
+      - run: make -C app check-browser
+        env:
+          FLIPPER_SDK_HEADERS: ${{ github.workspace }}/momentum
       - run: ln -s "$GITHUB_WORKSPACE/app" momentum/applications_user/tonie_emulator
       - run: ./fbt fap_tonie_emulator
         working-directory: momentum

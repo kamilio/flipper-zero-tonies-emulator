@@ -9,3 +9,6 @@ src/native/vendor/README.md for provenance and local changes.
 
 The launcher icon is original pixel art created for this project.
 This is an independent project, not an official tonies product.
+
+The embedded browser adapts this project's FileMan+ browser, with browser
+view styling and icons derived from Momentum Firmware (GPL version 3).

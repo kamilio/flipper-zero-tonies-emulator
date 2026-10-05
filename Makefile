@@ -7,7 +7,7 @@ FAP := $(SDK_DIR)/build/f7-firmware-C/.extapps/tonie_emulator.fap
 CANDIDATES := ../momentum ../../toy-blocks/.tools/momentum ../toy-blocks/.tools/momentum
 SDK_DIR ?= $(firstword $(foreach d,$(CANDIDATES),$(patsubst %/applications_user/tonie_emulator,%,$(wildcard $(d)/applications_user/tonie_emulator))))
 ifeq ($(SDK_DIR),)
-ifneq ($(filter-out check,$(or $(MAKECMDGOALS),build)),)
+ifneq ($(filter-out check check-browser,$(or $(MAKECMDGOALS),build)),)
 $(error No Momentum checkout found. Clone Momentum and link this repo into it:\n\
 	git clone --depth 1 https://github.com/Next-Flip/Momentum-Firmware ../momentum\n\
 	ln -s $(abspath .) ../momentum/applications_user/tonie_emulator)
@@ -45,3 +45,7 @@ check:
 	$(PYTHON) tests/test_write_controls.py
 	$(PYTHON) tests/test_reader.py
 	$(PYTHON) tests/test_read_check.py
+
+.PHONY: check-browser
+check-browser:
+	sh ./tests/run_browser_tests.sh

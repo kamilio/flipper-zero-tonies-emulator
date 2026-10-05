@@ -1,41 +1,73 @@
 #include "reader.h"
 #include "read_check.h"
-#include <dialogs/dialogs.h>
 #include <assets_icons.h>
 #include <gui/view_dispatcher.h>
 #include <gui/modules/popup.h>
-#include <gui/modules/text_input.h>
 #include <nfc/nfc_device.h>
 #include <nfc/nfc_poller.h>
 #include <nfc/protocols/slix/slix_poller.h>
-#include <toolbox/name_generator.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
-#define READ_DIR EXT_PATH("nfc")
-enum { ReaderPopup, ReaderName };
+enum { ReaderPopup, ReaderHistorySize = 16 };
+static const NotificationSequence reader_saved = {
+    &message_force_vibro_setting_on,
+    &message_red_0, &message_blue_0, &message_green_255,
+    &message_vibro_on, &message_delay_100, &message_vibro_off,
+    &message_delay_100, &message_green_0, &message_blue_255,
+    &message_do_not_reset, NULL,
+};
+
 typedef struct {
     ViewDispatcher* dispatcher;
     Popup* popup;
-    TextInput* input;
     Nfc* nfc;
     NfcPoller* poller;
     NfcDevice* device;
     Storage* storage;
+    FuriString* directory;
     NotificationApp* notifications;
     atomic_bool ready;
     atomic_bool retry;
     atomic_bool cancelled;
     const char* read_warning;
-    atomic_bool save_pending;
     unsigned password_index;
-    bool naming;
-    bool have_previous;
-    uint8_t previous_uid[8];
-    char name[64];
-    char submitted_name[64];
+    struct { uint8_t uid[8]; char name[40]; bool unchecked; } recent[ReaderHistorySize];
+    unsigned recent_count;
+    unsigned recent_next;
+    bool save_pending;
+    uint32_t retry_at;
+    uint32_t saved_count;
+    char status[64];
+    char name[40];
 } Reader;
+
+/* Keep filenames rather than sixteen full NFC snapshots. Re-read and compare
+ * the entire saved device (blocks and metadata), never UID alone. */
+static bool reader_seen(Reader* reader) {
+    const Iso15693_3Data* iso = nfc_device_get_data(reader->device, NfcProtocolIso15693_3);
+    for(unsigned i = 0; i < reader->recent_count; ++i) {
+        if(memcmp(reader->recent[i].uid, iso->uid, 8) != 0 ||
+           reader->recent[i].unchecked != (reader->read_warning != NULL)) continue;
+        FuriString* path = furi_string_alloc_printf("%s/%s.nfc", furi_string_get_cstr(reader->directory), reader->recent[i].name);
+        NfcDevice* previous = nfc_device_alloc();
+        bool equal = nfc_device_load(previous, furi_string_get_cstr(path)) &&
+            nfc_device_is_equal(reader->device, previous);
+        nfc_device_free(previous);
+        furi_string_free(path);
+        if(equal) return true;
+    }
+    return false;
+}
+
+static void reader_remember(Reader* reader, const uint8_t* uid) {
+    memcpy(reader->recent[reader->recent_next].uid, uid, 8);
+    snprintf(reader->recent[reader->recent_next].name, sizeof(reader->name), "%s", reader->name);
+    reader->recent[reader->recent_next].unchecked = reader->read_warning != NULL;
+    reader->recent_next = (reader->recent_next + 1) % ReaderHistorySize;
+    if(reader->recent_count < ReaderHistorySize) ++reader->recent_count;
+}
 
 static void reader_stop(Reader* reader) {
     if(!reader->poller) return;
@@ -112,62 +144,49 @@ static NfcCommand reader_callback(NfcGenericEvent event, void* context) {
     return NfcCommandContinue;
 }
 
+static void reader_show(Reader* reader, const char* header) {
+    popup_reset(reader->popup);
+    popup_set_icon(reader->popup, 0, 8, &I_NFC_manual_60x50);
+    popup_set_header(reader->popup, header, 97, 8, AlignCenter, AlignTop);
+    popup_set_text(reader->popup, reader->status, 94, 22, AlignCenter, AlignTop);
+    view_dispatcher_switch_to_view(reader->dispatcher, ReaderPopup);
+}
+
 static void reader_start(Reader* reader) {
-    reader->naming = false;
     reader->password_index = 0;
     atomic_store(&reader->cancelled, false);
     reader->read_warning = NULL;
     atomic_store(&reader->ready, false);
     atomic_store(&reader->retry, false);
-    popup_reset(reader->popup);
-    popup_set_icon(reader->popup, 0, 8, &I_NFC_manual_60x50);
-    popup_set_header(reader->popup, "Reading", 97, 15, AlignCenter, AlignTop);
-    popup_set_text(reader->popup,
-        reader->have_previous ? "Hold next card\nto Flipper's back" : "Hold card next\nto Flipper's back",
-        94, 27, AlignCenter, AlignTop);
-    view_dispatcher_switch_to_view(reader->dispatcher, ReaderPopup);
+    reader_show(reader, "Reading");
     reader->poller = nfc_poller_alloc(reader->nfc, NfcProtocolSlix);
     nfc_poller_start(reader->poller, reader_callback, reader);
 }
 
-static bool reader_validate(const char* text, FuriString* error, void* context) {
-    Reader* reader = context;
-    const size_t length = strlen(text);
-    bool invalid = !length || length >= sizeof(reader->name) || text[0] == '.' ||
-        (length && (text[length - 1] == ' ' || text[length - 1] == '.'));
-    for(const char* p = text; *p; ++p)
-        if((unsigned char)*p < 32 || (unsigned char)*p == 127 || strchr("<>:\"/\\|?*", *p)) invalid = true;
-    if(invalid) {
-        furi_string_set(error, "Choose a valid\nfile name.");
-        return false;
+/* UID names are reproducible; suffixes preserve any existing dump, even when
+ * the same chip is intentionally read in a later session. Never overwrite. */
+static bool reader_choose_name(Reader* reader) {
+    const Iso15693_3Data* iso = nfc_device_get_data(reader->device, NfcProtocolIso15693_3);
+    char base[32];
+    snprintf(base, sizeof(base), "SLIX_%02X%02X%02X%02X%02X%02X%02X%02X%s",
+        iso->uid[0], iso->uid[1], iso->uid[2], iso->uid[3],
+        iso->uid[4], iso->uid[5], iso->uid[6], iso->uid[7], reader->read_warning ? "_unchecked" : "");
+    for(unsigned suffix = 0; suffix < 1000; ++suffix) {
+        if(suffix) snprintf(reader->name, sizeof(reader->name), "%s_%u", base, suffix);
+        else snprintf(reader->name, sizeof(reader->name), "%s", base);
+        FuriString* path = furi_string_alloc_printf("%s/%s.nfc", furi_string_get_cstr(reader->directory), reader->name);
+        FS_Error status = storage_common_stat(reader->storage, furi_string_get_cstr(path), NULL);
+        furi_string_free(path);
+        if(status == FSE_NOT_EXIST) return true;
+        if(status != FSE_OK) return false;
     }
-    FuriString* path = furi_string_alloc_printf(READ_DIR "/%s.nfc", text);
-    bool available = storage_common_stat(reader->storage, furi_string_get_cstr(path), NULL) == FSE_NOT_EXIST;
-    furi_string_free(path);
-    if(!available) furi_string_set(error, "Name exists or\nSD unavailable.\nChoose another\nname/check SD.");
-    return available;
+    return false;
 }
 
-static void reader_name_done(void* context) {
-    Reader* reader = context;
-    /* Runs under the keyboard model lock. Capture exactly the confirmed name;
-     * the GUI may still receive input before the dispatcher handles this event. */
-    if(atomic_exchange(&reader->save_pending, true)) return;
-    memcpy(reader->submitted_name, reader->name, sizeof(reader->submitted_name));
-    view_dispatcher_send_custom_event(reader->dispatcher, 1);
-}
-
-static bool reader_save(void* context, uint32_t event) {
-    Reader* reader = context;
-    if(event != 1 || !reader->naming || !atomic_load(&reader->save_pending)) return false;
-    popup_reset(reader->popup);
-    popup_set_header(reader->popup, "Saving", 64, 25, AlignCenter, AlignTop);
-    view_dispatcher_switch_to_view(reader->dispatcher, ReaderPopup);
-    FuriString* error = furi_string_alloc();
-    bool ok = reader_validate(reader->submitted_name, error, reader);
-    FuriString* path = furi_string_alloc_printf(READ_DIR "/%s.nfc", reader->submitted_name);
-    FuriString* staging = furi_string_alloc_printf(READ_DIR "/.tonie-read-%lu.tmp", (unsigned long)furi_get_tick());
-    /* Verify a private staging file before publishing the user's named scan. */
+static bool reader_save(Reader* reader) {
+    bool ok = reader_choose_name(reader);
+    FuriString* path = furi_string_alloc_printf("%s/%s.nfc", furi_string_get_cstr(reader->directory), reader->name);
+    FuriString* staging = furi_string_alloc_printf("%s/.tonie-read-%lu.tmp", furi_string_get_cstr(reader->directory), (unsigned long)furi_get_tick());
     bool owned = false;
     if(ok) {
         owned = storage_common_stat(reader->storage, furi_string_get_cstr(staging), NULL) == FSE_NOT_EXIST;
@@ -178,43 +197,41 @@ static bool reader_save(void* context, uint32_t event) {
         ok = nfc_device_load(check, furi_string_get_cstr(staging)) && nfc_device_is_equal(reader->device, check);
         nfc_device_free(check);
     }
-    if(ok) ok = reader_validate(reader->submitted_name, error, reader) &&
+    if(ok) ok = storage_common_stat(reader->storage, furi_string_get_cstr(path), NULL) == FSE_NOT_EXIST &&
         storage_common_rename_safe(reader->storage, furi_string_get_cstr(staging), furi_string_get_cstr(path)) == FSE_OK;
     if(owned && !ok) storage_common_remove(reader->storage, furi_string_get_cstr(staging));
     furi_string_free(staging);
     furi_string_free(path);
-    furi_string_free(error);
-    atomic_store(&reader->save_pending, false);
-    if(ok) {
-        const Iso15693_3Data* iso = nfc_device_get_data(reader->device, NfcProtocolIso15693_3);
-        memcpy(reader->previous_uid, iso->uid, sizeof(reader->previous_uid));
-        reader->have_previous = true;
-        notification_message(reader->notifications, &sequence_success);
-        reader_start(reader);
-    } else {
-        /* Keep the complete read in RAM and the name editable for a safe retry. */
-        text_input_set_header_text(reader->input, "Save failed - check SD");
-        view_dispatcher_switch_to_view(reader->dispatcher, ReaderName);
-        notification_message(reader->notifications, &sequence_error);
-    }
-    return true;
+    return ok;
 }
 
-static bool reader_save_warning(Reader* reader) {
-    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
-    DialogMessage* message = dialog_message_alloc();
-    dialog_message_set_header(message, "Possibly corrupted", 64, 2, AlignCenter, AlignTop);
-    dialog_message_set_text(message, reader->read_warning, 64, 23, AlignCenter, AlignTop);
-    dialog_message_set_buttons(message, "Skip", "Save anyway", NULL);
-    const bool save = dialog_message_show(dialogs, message) == DialogMessageButtonCenter;
-    dialog_message_free(message);
-    furi_record_close(RECORD_DIALOGS);
-    return save;
+static void reader_try_save(Reader* reader) {
+    if(reader_save(reader)) {
+        const Iso15693_3Data* iso = nfc_device_get_data(reader->device, NfcProtocolIso15693_3);
+        reader_remember(reader, iso->uid);
+        ++reader->saved_count;
+        reader->save_pending = false;
+        snprintf(reader->status, sizeof(reader->status), "Saved: %lu%s\nHold next card", (unsigned long)reader->saved_count, reader->read_warning ? "\nUnchecked read" : "");
+        notification_message(reader->notifications, &reader_saved);
+        reader_start(reader);
+    } else {
+        /* Retain the snapshot until SD recovers. No success feedback or history
+         * insertion until the verified file has actually been published. */
+        if(!reader->save_pending) notification_message(reader->notifications, &sequence_error);
+        reader->save_pending = true;
+        reader->retry_at = furi_get_tick();
+        snprintf(reader->status, sizeof(reader->status), "Check SD card\nAuto retry...\nBack to exit");
+        reader_show(reader, "Save failed");
+    }
 }
 
 static void reader_tick(void* context) {
     Reader* reader = context;
-    if(reader->naming) return;
+    if(reader->save_pending) {
+        if((uint32_t)(furi_get_tick() - reader->retry_at) >= furi_ms_to_ticks(1000))
+            reader_try_save(reader);
+        return;
+    }
     if(atomic_load(&reader->retry)) {
         reader_stop(reader);
         reader_start(reader);
@@ -222,72 +239,48 @@ static void reader_tick(void* context) {
     }
     if(!atomic_load(&reader->ready)) return;
     reader_stop(reader);
-    const Iso15693_3Data* iso = nfc_device_get_data(reader->device, NfcProtocolIso15693_3);
-    if(reader->have_previous && memcmp(reader->previous_uid, iso->uid, 8) == 0) {
+    if(reader_seen(reader)) {
+        snprintf(reader->status, sizeof(reader->status), "Duplicate skipped\nSaved: %lu\nHold next card", (unsigned long)reader->saved_count);
         reader_start(reader);
         return;
     }
-    if(reader->read_warning) {
-        if(!reader_save_warning(reader)) {
-            memcpy(reader->previous_uid, iso->uid, sizeof(reader->previous_uid));
-            reader->have_previous = true;
-            reader_start(reader);
-            return;
-        }
-    }
-    reader->naming = true;
-    name_generator_make_auto(reader->name, sizeof(reader->name), "SLIX");
-    text_input_reset(reader->input);
-    text_input_set_header_text(reader->input, "Name the card");
-    text_input_set_minimum_length(reader->input, 1);
-    text_input_set_result_callback(reader->input, reader_name_done, reader, reader->name, sizeof(reader->name), true);
-    text_input_set_validator(reader->input, reader_validate, reader);
-    view_dispatcher_switch_to_view(reader->dispatcher, ReaderName);
+    reader_try_save(reader);
 }
 
 static bool reader_back(void* context) {
-    Reader* reader = context;
-    if(reader->naming) {
-        /* Back discards this unsaved read, without an extra confirmation. */
-        const Iso15693_3Data* iso = nfc_device_get_data(reader->device, NfcProtocolIso15693_3);
-        memcpy(reader->previous_uid, iso->uid, sizeof(reader->previous_uid));
-        reader->have_previous = true;
-        reader_start(reader);
-        return true;
-    }
+    UNUSED(context);
     return false;
 }
 
-void tonie_reader_run(Gui* gui, Nfc* nfc, Storage* storage, NotificationApp* notifications) {
+void tonie_reader_run(Gui* gui, Nfc* nfc, Storage* storage, NotificationApp* notifications, const char* directory) {
+    furi_assert(directory && directory[0] == '/');
     Reader* reader = malloc(sizeof(Reader));
     memset(reader, 0, sizeof(*reader));
     atomic_init(&reader->ready, false);
     atomic_init(&reader->retry, false);
     atomic_init(&reader->cancelled, false);
-    atomic_init(&reader->save_pending, false);
     reader->nfc = nfc;
     reader->storage = storage;
+    reader->directory = furi_string_alloc_set_str(directory);
     reader->notifications = notifications;
     reader->device = nfc_device_alloc();
     reader->dispatcher = view_dispatcher_alloc();
     reader->popup = popup_alloc();
-    reader->input = text_input_alloc();
-    storage_common_mkdir(storage, READ_DIR);
+    snprintf(reader->status, sizeof(reader->status), "Hold card next\nto Flipper's back");
     view_dispatcher_set_event_callback_context(reader->dispatcher, reader);
     view_dispatcher_set_navigation_event_callback(reader->dispatcher, reader_back);
-    view_dispatcher_set_custom_event_callback(reader->dispatcher, reader_save);
     view_dispatcher_set_tick_event_callback(reader->dispatcher, reader_tick, 100);
     view_dispatcher_add_view(reader->dispatcher, ReaderPopup, popup_get_view(reader->popup));
-    view_dispatcher_add_view(reader->dispatcher, ReaderName, text_input_get_view(reader->input));
     view_dispatcher_attach_to_gui(reader->dispatcher, gui, ViewDispatcherTypeFullscreen);
+    notification_message(reader->notifications, &sequence_set_only_blue_255);
     reader_start(reader);
     view_dispatcher_run(reader->dispatcher);
     reader_stop(reader);
+    notification_message_block(reader->notifications, &sequence_reset_rgb);
     view_dispatcher_remove_view(reader->dispatcher, ReaderPopup);
-    view_dispatcher_remove_view(reader->dispatcher, ReaderName);
-    text_input_free(reader->input);
     popup_free(reader->popup);
     view_dispatcher_free(reader->dispatcher);
     nfc_device_free(reader->device);
+    furi_string_free(reader->directory);
     free(reader);
 }

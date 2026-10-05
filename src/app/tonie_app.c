@@ -2,6 +2,7 @@
 #include "log_sink.h"
 #include "writer.h"
 #include "reader.h"
+#include "../lib/file_browser/fs_browser.h"
 #include "../native/tonie_native.h"
 #include <stdatomic.h>
 
@@ -97,7 +98,8 @@ typedef struct {
     bool write_ok;
     bool write_result_visible;
     FuriMutex* ui_mutex;
-    char ui_title[96];
+    FuriString* ui_title;
+    uint32_t ui_title_started;
     char ui_status[64];
     bool ui_writing;
     bool ui_result;
@@ -112,6 +114,7 @@ typedef struct {
     BitBuffer* tx_buffer;
     NfcDevice* device;
     FuriString* file_path;
+    FuriString* browser_directory;
     TonieTag tag;
     TonieSession session;
     atomic_int writer_state; /* CLI "write_chip" command trigger */
@@ -498,13 +501,28 @@ static bool load_file(TonieApp* app) {
 }
 
 static bool choose_file(TonieApp* app) {
-    DialogsFileBrowserOptions options;
-    dialog_file_browser_set_basic_options(&options, ".nfc", NULL);
-    options.base_path = NFC_DIR;
-    options.hide_dot_files = true;
-    if(furi_string_empty(app->file_path)) furi_string_set(app->file_path, NFC_DIR);
-    if(!dialog_file_browser_show(app->dialogs, app->file_path, app->file_path, &options)) return false;
-    return load_file(app);
+    const FsBrowserConfig config = {
+        .root_path = NFC_DIR,
+        .extension = ".nfc",
+        .action_label = "Read / Unlock",
+        .cache_directory = EXT_PATH("apps_data/tonie_emulator"),
+    };
+    while(true) {
+        FsBrowserResult result = fs_browser_run(app->gui, &config, app->browser_directory, app->file_path);
+        if(result == FsBrowserCancelled) return false;
+        if(result == FsBrowserDirectoryAction) {
+            tonie_reader_run(app->gui, app->nfc, app->storage, app->notifications,
+                            furi_string_get_cstr(app->browser_directory));
+            continue; // Reopen the same directory with a fresh listing after reading.
+        }
+        if(load_file(app)) return true;
+        DialogMessage* error = dialog_message_alloc();
+        dialog_message_set_header(error, "Cannot load file", 64, 8, AlignCenter, AlignTop);
+        dialog_message_set_text(error, app->status, 64, 30, AlignCenter, AlignCenter);
+        dialog_message_set_buttons(error, "Back", NULL, NULL);
+        dialog_message_show(app->dialogs, error);
+        dialog_message_free(error);
+    }
 }
 
 static uint32_t selected_fdt(const TonieApp* app) {
@@ -581,22 +599,28 @@ static const char* base_name(const char* path) {
 /* Publish a small UI snapshot; the GUI never reads mutable NFC/file state. */
 static void update_view(TonieApp* app) {
     furi_mutex_acquire(app->ui_mutex, FuriWaitForever);
-    snprintf(app->ui_title, sizeof(app->ui_title), "%s",
-             base_name(furi_string_get_cstr(app->file_path)));
-    char* extension = strrchr(app->ui_title, '.');
-    if(extension) *extension = '\0';
+    FuriString* title = app->ui_text;
+    furi_string_set(title, base_name(furi_string_get_cstr(app->file_path)));
+    const char* extension = strrchr(furi_string_get_cstr(title), '.');
+    if(extension) furi_string_left(title, extension - furi_string_get_cstr(title));
     bool upper = true;
-    for(char* c = app->ui_title; *c; ++c) {
-        if(*c == '-' || *c == '_') *c = ' ';
-        if(upper && *c >= 'a' && *c <= 'z') *c -= 'a' - 'A';
-        upper = *c == ' ';
+    for(size_t i = 0; i < furi_string_size(title); ++i) {
+        char c = furi_string_get_char(title, i);
+        if(c == '-' || c == '_') c = ' ';
+        if(upper && c >= 'a' && c <= 'z') c -= 'a' - 'A';
+        upper = c == ' ';
+        furi_string_set_char(title, i, c);
     }
     app->ui_writing = atomic_load(&app->writer_state) == WriterRunning && !app->write_result_visible;
     app->ui_result = app->write_result_visible;
     app->ui_loaded = app->loaded;
     app->ui_operation = app->operation;
     if(app->ui_writing && app->operation != ChipWrite)
-        snprintf(app->ui_title, sizeof(app->ui_title), "Chip at Flipper's back");
+        furi_string_set(title, "Chip at Flipper's back");
+    if(furi_string_cmp(app->ui_title, title)) {
+        furi_string_set(app->ui_title, title);
+        app->ui_title_started = furi_get_tick();
+    }
     if(app->ui_writing) {
         const unsigned done = tonie_writer_progress(app->writer);
         const TonieWritePhase phase = tonie_writer_phase(app->writer);
@@ -684,10 +708,26 @@ static void draw(Canvas* canvas, void* context) {
                                              app->ui_operation == ChipAuth ? "Auth result" : "Write result") : "Tonie Emulator");
     canvas_set_font(canvas, FontSecondary);
     FuriString* name = app->ui_text;
-    furi_string_set(name, app->ui_title);
-    elements_string_fit_width(canvas, name, 120);
-    if(!app->ui_result)
-        canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignTop, furi_string_get_cstr(name));
+    if(!app->ui_result) {
+        const char* title = furi_string_get_cstr(app->ui_title);
+        const uint32_t width = canvas_string_width(canvas, title);
+        if(width <= 120) {
+            canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignTop, title);
+        } else {
+            /* Move the complete UTF-8 string by pixels instead of truncating
+             * bytes. Pause one second at each end, then reverse direction. */
+            const uint32_t distance = width - 120;
+            const uint32_t step = (uint32_t)(furi_get_tick() - app->ui_title_started) /
+                furi_ms_to_ticks(40);
+            const uint32_t phase = step % (2 * distance + 50);
+            uint32_t offset;
+            if(phase < 25) offset = 0;
+            else if(phase < distance + 25) offset = phase - 25;
+            else if(phase < distance + 50) offset = distance;
+            else offset = 2 * distance + 50 - phase;
+            canvas_draw_str_aligned(canvas, 4 - (int32_t)offset, 30, AlignLeft, AlignTop, title);
+        }
+    }
     if(app->ui_result) {
         /* Results may include partial-write details; wrap instead of hiding them. */
         elements_text_box(canvas, 1, 29, 126, 24, AlignCenter, AlignCenter, app->ui_status, true);
@@ -884,9 +924,11 @@ int32_t tonie_emulator_app(void* context) {
     app->nfc = nfc_alloc();
     app->ui_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     app->ui_text = furi_string_alloc();
+    app->ui_title = furi_string_alloc();
     app->writer = tonie_writer_alloc();
     app->tx_buffer = bit_buffer_alloc(TONIE_MAX_RESPONSE + 2U);
     app->file_path = furi_string_alloc_set_str(NFC_DIR);
+    app->browser_directory = furi_string_alloc_set_str(NFC_DIR);
     app->input_queue = furi_message_queue_alloc(8, sizeof(InputEvent));
     app->view_port = view_port_alloc();
     CliRegistry* cli = furi_record_open(RECORD_CLI);
@@ -902,6 +944,8 @@ int32_t tonie_emulator_app(void* context) {
     bool selected;
     if(launch_path && strncmp(launch_path, "/ext/", 5) == 0) {
         furi_string_set(app->file_path, launch_path);
+        const char* slash = strrchr(launch_path, '/');
+        if(slash) furi_string_set_strn(app->browser_directory, launch_path, slash - launch_path);
         selected = load_file(app);
     } else {
         selected = choose_file(app);
@@ -948,7 +992,8 @@ int32_t tonie_emulator_app(void* context) {
                         atomic_store(&app->writer_state, WriterUnavailable);
                         emulation_stop(app);
                         gui_remove_view_port(app->gui, app->view_port);
-                        tonie_reader_run(app->gui, app->nfc, app->storage, app->notifications);
+                        tonie_reader_run(app->gui, app->nfc, app->storage, app->notifications,
+                                         furi_string_get_cstr(app->browser_directory));
                         gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
                         furi_message_queue_reset(app->input_queue);
                         emulation_start(app);
@@ -972,8 +1017,10 @@ int32_t tonie_emulator_app(void* context) {
     view_port_free(app->view_port);
     furi_mutex_free(app->ui_mutex);
     furi_string_free(app->ui_text);
+    furi_string_free(app->ui_title);
     furi_message_queue_free(app->input_queue);
     furi_string_free(app->file_path);
+    furi_string_free(app->browser_directory);
     bit_buffer_free(app->tx_buffer);
     tonie_writer_free(app->writer);
     nfc_free(app->nfc);

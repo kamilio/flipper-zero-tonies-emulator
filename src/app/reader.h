@@ -4,5 +4,5 @@
 #include <storage/storage.h>
 #include <notification/notification_messages.h>
 
-/* Owns NFC until Back. Each complete read goes straight to the native name editor. */
-void tonie_reader_run(Gui* gui, Nfc* nfc, Storage* storage, NotificationApp* notifications);
+/* Saves in the supplied directory (copied on entry). Owns NFC until Back. Automatically names and saves reads; identical recent dumps are skipped. */
+void tonie_reader_run(Gui* gui, Nfc* nfc, Storage* storage, NotificationApp* notifications, const char* directory);
