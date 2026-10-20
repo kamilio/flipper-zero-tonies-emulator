@@ -1,16 +1,21 @@
 PYTHON ?= python3
 FAP := $(SDK_DIR)/build/f7-firmware-C/.extapps/tonie_emulator.fap
 
+define momentum_error
+No Momentum checkout found.
+Clone Momentum and link this repo into it:
+ln -s $(abspath .) ../Momentum-Firmware/applications_user/tonie_emulator
+endef
+
 # No SDK_DIR given: use the first checkout that already knows this app.
 # A checkout "knows" the app when applications_user/tonie_emulator points here
 # (fbt builds the linked source in place, so no copying or syncing is needed).
-CANDIDATES := ../momentum ../../toy-blocks/.tools/momentum ../toy-blocks/.tools/momentum
+CANDIDATES := ../Momentum-Firmware ../momentum ../../toy-blocks/.tools/momentum ../toy-blocks/.tools/momentum
 SDK_DIR ?= $(firstword $(foreach d,$(CANDIDATES),$(patsubst %/applications_user/tonie_emulator,%,$(wildcard $(d)/applications_user/tonie_emulator))))
 ifeq ($(SDK_DIR),)
 ifneq ($(filter-out check check-browser,$(or $(MAKECMDGOALS),build)),)
-$(error No Momentum checkout found. Clone Momentum and link this repo into it:\n\
-	git clone --depth 1 https://github.com/Next-Flip/Momentum-Firmware ../momentum\n\
-	ln -s $(abspath .) ../momentum/applications_user/tonie_emulator)
+$(info $(momentum_error))
+$(error Aborting)
 endif
 endif
 SDK_DIR := $(abspath $(SDK_DIR))
